@@ -16,6 +16,9 @@ class PaymentAlreadyReversed(Exception):
 class ReversalConflict(Exception):
     """冲正标识已被用于冲正另一笔收款。"""
 
+class ReversalBlockedBySettlement(Exception):
+    """订单存在未撤销的结算单，核销闭合期间不允许冲正收款。"""
+
 def insert(tenant: str, order_id: str, amount_cents: int, currency: str) -> None:
     conn = connect()
     try:
@@ -83,6 +86,16 @@ def reverse_payment(tenant: str, order_id: str, reversal_id: str, payment_id: st
         if order is None:
             conn.execute("ROLLBACK")
             return None
+
+        blocked = conn.execute(
+            "SELECT 1 FROM settlements WHERE tenant=? AND order_id=? AND status='active'",
+            (tenant, order_id),
+        ).fetchone()
+        if blocked is not None:
+            # 核销闭合期间（存在未撤销结算单）不允许冲正收款，否则结算金额快照与未冲正收款合计会脱节；
+            # 需先撤销结算再冲正。状态保持不变
+            conn.execute("ROLLBACK")
+            raise ReversalBlockedBySettlement("payment reversal blocked by active settlement")
 
         existing = conn.execute(
             "SELECT reversal_id, payment_id, amount_cents FROM reversals WHERE tenant=? AND order_id=? AND reversal_id=?",

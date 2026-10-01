@@ -5,7 +5,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders, payment_imports
+from app.store import orders, payment_imports, settlements
 from app.store.db import connect, migrate
 
 app = FastAPI(title="settlement-ledger")
@@ -22,6 +22,12 @@ class PaymentIn(BaseModel):
 class ReversalIn(BaseModel):
     reversal_id: str = Field(min_length=1)
     payment_id: str = Field(min_length=1)
+
+class SettlementIn(BaseModel):
+    settlement_id: str = Field(min_length=1)
+
+class SettlementRevocationIn(BaseModel):
+    revocation_id: str = Field(min_length=1)
 
 class PaymentImportLineIn(BaseModel):
     # 行内字段保持宽容：金额非法等业务问题按行拒绝，而不是让整批 422
@@ -88,9 +94,60 @@ def reverse_payment(order_id: str, body: ReversalIn, x_tenant: str = Header(defa
         raise HTTPException(status_code=409, detail=str(error))
     except orders.ReversalConflict as error:
         raise HTTPException(status_code=409, detail=str(error))
+    except orders.ReversalBlockedBySettlement as error:
+        raise HTTPException(status_code=409, detail=str(error))
     if result is None:
         raise HTTPException(status_code=404, detail="order not found")
     return result
+
+@app.post("/orders/{order_id}/settlements", status_code=201)
+def settle_order(order_id: str, body: SettlementIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        view, _created = settlements.settle(x_tenant, order_id, body.settlement_id)
+    except settlements.SettlementNotFound as error:
+        # 订单不存在/跨租户点名统一按不存在处理
+        raise HTTPException(status_code=404, detail=str(error))
+    except settlements.OrderNotFullyPaid as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    except settlements.SettlementNotBalanced as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    except settlements.SettlementAlreadyActive as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    except settlements.SettlementKeyConflict as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    return _settlement_response(view)
+
+@app.post("/settlements/{settlement_doc_id}/revocations")
+def revoke_settlement(settlement_doc_id: str, body: SettlementRevocationIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        view = settlements.revoke(x_tenant, settlement_doc_id, body.revocation_id)
+    except settlements.SettlementNotFound:
+        # 结算单不存在（含跨租户点名、撤销不存在的结算单）按不存在处理
+        raise HTTPException(status_code=404, detail="settlement not found")
+    except settlements.SettlementAlreadyRevoked as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    except settlements.RevocationConflict as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    return _settlement_response(view)
+
+def _settlement_response(view: dict) -> dict:
+    # 对外字段：settlement_id 为调用方指定的结算标识（原样回显），
+    # settlement_doc_id 为服务端分配的结算单单据标识（撤销时点名使用）
+    return {
+        "settlement_doc_id": view["settlement_id"],
+        "settlement_id": view["settlement_key"],
+        "order_id": view["order_id"],
+        "tenant": view["tenant"],
+        "amount_cents": view["amount_cents"],
+        "status": view["status"],
+        "created_at": view["created_at"],
+        "revoked_at": view["revoked_at"],
+        **({"revocation_id": view["revocation_id"]} if "revocation_id" in view else {}),
+    }
 
 @app.post("/payment-imports")
 def import_payments(body: PaymentImportIn, x_tenant: str = Header(default="")) -> dict:
