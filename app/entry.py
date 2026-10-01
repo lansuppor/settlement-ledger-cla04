@@ -1,10 +1,11 @@
 import argparse
-from fastapi import FastAPI, Header, HTTPException, Response
+
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-from app.config import tenant_header
+
+from app.rules import order_rules
 from app.store import orders
 from app.store.db import connect, migrate
-from app.rules import order_rules
 
 app = FastAPI(title="settlement-ledger")
 
@@ -16,6 +17,10 @@ class OrderIn(BaseModel):
 
 class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
+
+class ReversalIn(BaseModel):
+    reversal_id: str = Field(min_length=1)
+    payment_id: str = Field(min_length=1)
 
 @app.get("/health")
 def health() -> dict:
@@ -53,11 +58,28 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
         raise HTTPException(status_code=400, detail="tenant header is required")
     try:
         order = orders.add_payment(x_tenant, order_id, body.amount_cents)
-    except ValueError as error:
+    except orders.PaymentExceedsOutstanding as error:
         raise HTTPException(status_code=409, detail=str(error))
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+@app.post("/orders/{order_id}/reversals")
+def reverse_payment(order_id: str, body: ReversalIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        result = orders.reverse_payment(x_tenant, order_id, body.reversal_id, body.payment_id)
+    except orders.PaymentNotFound:
+        # 收款不存在（含跨租户点名）一律按不存在处理，不泄漏对象是否存在
+        raise HTTPException(status_code=404, detail="payment not found")
+    except orders.PaymentAlreadyReversed as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    except orders.ReversalConflict as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    if result is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return result
 
 def main() -> None:
     parser = argparse.ArgumentParser()
