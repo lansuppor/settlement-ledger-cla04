@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额、收款冲正与批量导入，以及按已收满订单发起结算单进行对账核销与撤销；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额、收款冲正与批量导入，以及按已收满订单发起结算单进行对账核销与撤销，并支持按订单检索结算单列表与对账留痕查询；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -41,6 +41,11 @@
   - 同一撤销标识 + 同一结算单重复请求为幂等重放，返回与首次一致；指向另一结算单返回 409（`revocation id already used for another settlement`）；
   - 撤销不存在的结算单（含跨租户点名）返回 404（`settlement not found`）；撤销已被撤销的结算单（新撤销标识）返回 409（`settlement already revoked`）；
   - 撤销只解除核销状态，不改变订单收款与已收金额；撤销后订单可再次发起结算。
+- `GET /orders/{order_id}/settlements`：按订单检索结算单列表与对账核对结果（**只读留痕查询**）。租户通过请求头 `X-Tenant` 传入；订单不存在/跨租户返回 404（`order not found`，与订单不存在同结论，不泄漏对象是否存在）；缺少租户头返回 400。
+  - 可选查询参数 `status`：`active`（仅未撤销）、`revoked`（仅已撤销）、`all`（全部，默认）。其他取值返回 400；过滤只影响返回范围，不改变任何单据状态与金额。
+  - `settlements[]` 按结算单生成时间从早到晚稳定排序，首次核销、撤销后重新核销形成的多张结算单都按先后给出；每项含 `settlement_id`（结算标识）、`settlement_doc_id`（结算单单据标识）、`amount_cents`（核销金额快照，旧单不随后续撤销/再结算改变）、`status`（`active`/`revoked`）、`created_at`、`revoked_at`，已撤销的另含 `revocation_id`。
+  - `reconciliation` 同时给出 `order_amount_cents`（订单金额）、`booked_paid_cents`（账面已收）、`live_payments_total_cents`（该订单未被冲正的收款合计）、`outstanding_cents`（未收 = 订单金额 − 账面已收），并以 `closed`/`conclusion` 给出是否闭合的结论：闭合时为 `closed` 且 `discrepancies` 为空；任一不闭合时为 `not_closed`，并在 `discrepancies` 中逐项说明差异所在，不静默给出成功结论。
+  - 查询为只读操作：重复查询、查询后再发起结算或撤销，都不改变既有结算单、收款与订单状态；列表与对账合计取自同一只读事务快照，检索结果与逐笔数据始终一致，服务重启后同一查询返回一致结果。
 - `GET /health`：返回服务与数据库状态。
 
 ## 数据与配置
@@ -158,6 +163,61 @@ curl -s -XPOST localhost:8000/settlements/3f9a.../revocations \
 - `settlement_doc_id`（结算单单据标识）：服务端分配的结算单主键，撤销接口路径点名使用；重新结算会得到新的单据标识。
 - `amount_cents`：核销时的金额快照，恒等于核销时未被冲正的收款合计与订单金额，撤销后也保留，便于事后对账。
 - `revocation_id`（撤销标识）：调用方指定、租户内唯一的本次撤销标识，承担幂等键作用；同一标识只能指向同一结算单。
+
+## 结算单检索与对账留痕查询
+
+`GET /orders/{order_id}/settlements` 让调用方在路径中给出订单标识、用 `X-Tenant` 指定租户，一次查到该订单的**核销历史时间线**与**对账核对依据**。该接口为只读，不改变任何状态。
+
+查询条件（可选）：
+
+- `status=active`：仅返回未撤销结算单；
+- `status=revoked`：仅返回已撤销结算单；
+- `status=all` 或不传：返回全部（默认）。
+- 过滤只影响返回范围，不改变任何单据状态与金额；非法取值返回 400。
+
+调用示例：
+
+```bash
+# 查询某订单的全部结算单与对账核对结果
+curl -s localhost:8000/orders/ord-1/settlements -H 'X-Tenant: t1'
+# 200
+# {"tenant":"t1","order_id":"ord-1","currency":"CNY","status_filter":"all",
+#  "settlements":[
+#    {"settlement_id":"set-20261001-01","settlement_doc_id":"3f9a...","order_id":"ord-1",
+#     "amount_cents":500,"status":"revoked","created_at":"...","revoked_at":"...",
+#     "revocation_id":"cancel-20261001-01"},
+#    {"settlement_id":"set-20261001-02","settlement_doc_id":"7b21...","order_id":"ord-1",
+#     "amount_cents":500,"status":"active","created_at":"...","revoked_at":null}],
+#  "reconciliation":{
+#    "order_amount_cents":500,"booked_paid_cents":500,
+#    "live_payments_total_cents":500,"outstanding_cents":0,
+#    "closed":true,"conclusion":"closed","discrepancies":[]}}
+
+# 只看未撤销的结算单（过滤不影响对账核对结果）
+curl -s 'localhost:8000/orders/ord-1/settlements?status=active' -H 'X-Tenant: t1'
+```
+
+结果字段含义：
+
+- `settlements[]`：按结算单**生成时间从早到晚**稳定排序；同一订单多次结算（首次核销、撤销后重新核销）都按先后顺序给出，旧结算单保留不删除。同毫秒落库时以存储插入次序兜底，先后关系仍可还原。
+  - `settlement_id`：调用方指定的结算标识；
+  - `settlement_doc_id`：服务端分配的结算单单据标识；
+  - `amount_cents`：核销时的金额快照，恒等于核销时未被冲正收款合计与订单金额，**不因后续撤销或再结算而改变**；
+  - `status`：`active`（未撤销）/ `revoked`（已撤销）；
+  - `created_at` / `revoked_at`：生成时间与撤销时间（未撤销时 `revoked_at` 为 `null`，且无 `revocation_id` 字段）；
+  - `revocation_id`：仅已撤销结算单给出，为撤销该单时点名的撤销标识。
+- `reconciliation`（对账核对结果）：
+  - `order_amount_cents`：订单金额；
+  - `booked_paid_cents`：账面已收金额（订单账面值）；
+  - `live_payments_total_cents`：该订单**未被冲正**的收款合计（逐笔明细实时汇总，被冲正的收款不计入）；
+  - `outstanding_cents`：未收金额 = 订单金额 − 账面已收；
+  - `closed` / `conclusion`：是否闭合。闭合恒等关系为：账面已收 = 未被冲正收款合计，且 已收 + 未收 = 订单金额；两式同时成立时 `closed=true`、`conclusion="closed"`、`discrepancies=[]`。
+  - 任一恒等式不成立时 `closed=false`、`conclusion="not_closed"`，`discrepancies[]` 逐项给出 `check`（不满足的核对项）、`expected`/`actual`/`difference_cents`（期望值、实际值与差额）与 `message`（差异说明），而不是静默给出成功结论。正常受理/收款/冲正/结算写路径保证两式恒成立，未闭合只可能出现在账实被外部破坏时，用于事后暴露差异。
+
+隔离与一致性：
+
+- 使用其他租户请求头查询本租户订单一律按不存在处理（404 `order not found`），不泄漏对象是否存在；结果只含该租户自己的结算单与收款数据，不混入其他租户记录。
+- 列表与对账合计取自同一只读事务的一致性快照，检索结果与逐笔数据始终一致；重复查询、查询后再结算或撤销都不改变既有结算单、收款与订单状态；数据持久化，服务重启后同一查询返回与重启前一致的结果，多次核销、撤销与再核销的顺序关系仍可还原。
 
 ## 金额闭合与并发语义
 

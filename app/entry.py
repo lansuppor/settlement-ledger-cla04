@@ -1,7 +1,7 @@
 import argparse
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
@@ -118,6 +118,24 @@ def settle_order(order_id: str, body: SettlementIn, x_tenant: str = Header(defau
     except settlements.SettlementKeyConflict as error:
         raise HTTPException(status_code=409, detail=str(error))
     return _settlement_response(view)
+
+@app.get("/orders/{order_id}/settlements")
+def read_order_settlements(
+    order_id: str,
+    x_tenant: str = Header(default=""),
+    status: str = Query(default=settlements.ALL),
+) -> dict:
+    # 只读留痕查询：返回该订单结算单时间线与对账核对结果，不改变任何单据状态与金额
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if status not in settlements.STATUS_FILTERS:
+        # 仅支持未撤销(active)/已撤销(revoked)/全部(all)，未指定时默认全部
+        raise HTTPException(status_code=400, detail="invalid status filter; expected one of active, revoked, all")
+    view = settlements.list_for_order(x_tenant, order_id, status)
+    if view is None:
+        # 订单不存在/跨租户点名统一按不存在处理，不泄漏对象是否存在
+        raise HTTPException(status_code=404, detail="order not found")
+    return view
 
 @app.post("/settlements/{settlement_doc_id}/revocations")
 def revoke_settlement(settlement_doc_id: str, body: SettlementRevocationIn, x_tenant: str = Header(default="")) -> dict:
