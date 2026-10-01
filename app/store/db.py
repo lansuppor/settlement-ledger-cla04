@@ -1,5 +1,6 @@
 import sqlite3
 from pathlib import Path
+
 from app.config import db_path
 
 SCHEMA = Path(__file__).resolve().parents[2] / "migrations" / "001_init.sql"

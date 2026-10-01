@@ -1,10 +1,11 @@
 import argparse
-from fastapi import FastAPI, Header, HTTPException, Response
+
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-from app.config import tenant_header
+
+from app.rules import order_rules
 from app.store import orders
 from app.store.db import connect, migrate
-from app.rules import order_rules
 
 app = FastAPI(title="settlement-ledger")
 
@@ -16,6 +17,10 @@ class OrderIn(BaseModel):
 
 class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
+
+class ReversalIn(BaseModel):
+    reversal_id: str = Field(min_length=1)
+    payment_id: int = Field(gt=0)
 
 @app.get("/health")
 def health() -> dict:
@@ -53,11 +58,25 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
         raise HTTPException(status_code=400, detail="tenant header is required")
     try:
         order = orders.add_payment(x_tenant, order_id, body.amount_cents)
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error))
+    except (ValueError, orders.LedgerError) as error:
+        detail = getattr(error, "detail", str(error))
+        raise HTTPException(status_code=409, detail=detail)
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+@app.post("/orders/{order_id}/reversals", status_code=200)
+def reverse_payment(order_id: str, body: ReversalIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        result = orders.reverse_payment(x_tenant, order_id, body.reversal_id, body.payment_id)
+    except orders.LedgerError as error:
+        # 业务拒绝（收款不存在/已被冲正/冲正标识冲突），与 5xx 内部错误明确区分。
+        raise HTTPException(status_code=409, detail={"reason": error.reason, "message": error.detail})
+    if result is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return result
 
 def main() -> None:
     parser = argparse.ArgumentParser()
