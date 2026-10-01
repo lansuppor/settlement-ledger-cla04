@@ -1,10 +1,11 @@
 import argparse
+from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders
+from app.store import orders, payment_imports
 from app.store.db import connect, migrate
 
 app = FastAPI(title="settlement-ledger")
@@ -21,6 +22,16 @@ class PaymentIn(BaseModel):
 class ReversalIn(BaseModel):
     reversal_id: str = Field(min_length=1)
     payment_id: str = Field(min_length=1)
+
+class PaymentImportLineIn(BaseModel):
+    # 行内字段保持宽容：金额非法等业务问题按行拒绝，而不是让整批 422
+    line_seq: int
+    order_id: str
+    amount_cents: Any
+
+class PaymentImportIn(BaseModel):
+    batch_id: str = Field(min_length=1)
+    lines: list[PaymentImportLineIn] = Field(min_length=1)
 
 @app.get("/health")
 def health() -> dict:
@@ -80,6 +91,32 @@ def reverse_payment(order_id: str, body: ReversalIn, x_tenant: str = Header(defa
     if result is None:
         raise HTTPException(status_code=404, detail="order not found")
     return result
+
+@app.post("/payment-imports")
+def import_payments(body: PaymentImportIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    lines = [
+        payment_imports.ImportLine(
+            line_no=line_no,
+            line_seq=item.line_seq,
+            order_id=item.order_id,
+            amount_cents=item.amount_cents,
+        )
+        for line_no, item in enumerate(body.lines, start=1)
+    ]
+    # 逐行独立事务：业务拒绝落到逐行结果；内部错误时出错行整笔回滚并以 5xx 返回，
+    # 此前已提交的行保持生效，调用方用同一批次标识续跑即可补齐剩余行
+    return payment_imports.submit(x_tenant, body.batch_id, lines)
+
+@app.get("/payment-imports/{batch_id}")
+def read_payment_import(batch_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    batch = payment_imports.get_batch(x_tenant, batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="import batch not found")
+    return batch
 
 def main() -> None:
     parser = argparse.ArgumentParser()
