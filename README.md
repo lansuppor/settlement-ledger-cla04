@@ -41,6 +41,9 @@
   - 同一撤销标识 + 同一结算单重复请求为幂等重放，返回与首次一致；指向另一结算单返回 409（`revocation id already used for another settlement`）；
   - 撤销不存在的结算单（含跨租户点名）返回 404（`settlement not found`）；撤销已被撤销的结算单（新撤销标识）返回 409（`settlement already revoked`）；
   - 撤销只解除核销状态，不改变订单收款与已收金额；撤销后订单可再次发起结算。
+- `GET /orders/{order_id}/settlements`：按订单检索结算单列表（核销时间线）。租户通过请求头 `X-Tenant` 传入；可选查询参数 `status` 过滤结算单状态：`active`（未撤销）、`revoked`（已撤销）、`all`（全部，缺省值），其他取值返回 400。过滤只影响返回范围，不改变任何单据状态与金额。列表按结算单生成时间从早到晚稳定排序，同一订单多次结算（首次核销、撤销后重新核销）按先后全部保留；每项含 `settlement_id`（结算标识）、`settlement_doc_id`（结算单单据标识）、`amount_cents`（核销金额快照，不随后续撤销/再结算改变）、`status`、`created_at`、`revoked_at`，已撤销项另含 `revocation_id`。订单不存在/跨租户查询返回 404（`order not found`），不泄漏对象是否存在；结果只含本租户数据。
+- `GET /orders/{order_id}/reconciliation`：查询订单的对账核对结果。租户通过请求头 `X-Tenant` 传入。返回 `amount_cents`（订单金额）、`paid_cents`（账面已收金额）、`live_paid_cents`（该订单未被冲正的收款合计）、`outstanding_cents`（未收金额）与闭合结论 `closed`。闭合不变量在结果中直接体现：`paid_cents` 恒等于 `live_paid_cents`，`paid_cents + outstanding_cents` 恒等于 `amount_cents`；任一不成立时 `closed` 为 `false`，且 `discrepancies` 逐项给出差异所在（核对项、两侧金额与差额），而不是静默给出成功结论。订单不存在/跨租户查询返回 404（`order not found`）。
+  - 两个查询均为只读：重复查询结果一致，查询后再次发起结算或撤销行为不变，既有结算单、收款与订单状态不受影响；结果持久化，服务重启后同一查询返回与重启前一致。
 - `GET /health`：返回服务与数据库状态。
 
 ## 数据与配置
@@ -158,6 +161,33 @@ curl -s -XPOST localhost:8000/settlements/3f9a.../revocations \
 - `settlement_doc_id`（结算单单据标识）：服务端分配的结算单主键，撤销接口路径点名使用；重新结算会得到新的单据标识。
 - `amount_cents`：核销时的金额快照，恒等于核销时未被冲正的收款合计与订单金额，撤销后也保留，便于事后对账。
 - `revocation_id`（撤销标识）：调用方指定、租户内唯一的本次撤销标识，承担幂等键作用；同一标识只能指向同一结算单。
+
+## 结算单检索与对账核对
+
+两个只读查询入口，供调用方核对本租户订单的核销历史与对账依据；均通过 `X-Tenant` 请求头指定租户，跨租户查询与订单不存在返回相同的 404 结论。
+
+```bash
+# 1. 按订单检索结算单列表（核销时间线），可选 status=active|revoked|all（缺省 all）
+curl -s 'localhost:8000/orders/ord-1/settlements?status=all' -H 'X-Tenant: t1'
+# {"tenant":"t1","order_id":"ord-1","status_filter":"all","settlements":[
+#   {"settlement_doc_id":"3f9a...","settlement_id":"set-20261001-01","order_id":"ord-1",
+#    "tenant":"t1","amount_cents":500,"status":"revoked","created_at":"...",
+#    "revoked_at":"...","revocation_id":"cancel-20261001-01"},
+#   {"settlement_doc_id":"8c2e...","settlement_id":"set-20261001-02","order_id":"ord-1",
+#    "tenant":"t1","amount_cents":500,"status":"active","created_at":"...","revoked_at":null}]}
+
+# 2. 查询对账核对结果
+curl -s localhost:8000/orders/ord-1/reconciliation -H 'X-Tenant: t1'
+# 闭合：{"order_id":"ord-1","amount_cents":500,"paid_cents":500,"live_paid_cents":500,
+#        "outstanding_cents":0,"closed":true,"discrepancies":[], ...}
+# 未闭合（账面与明细脱节）：closed=false，discrepancies 给出差异，例如
+# {"check":"paid_equals_live_payments","paid_cents":400,"live_paid_cents":500,
+#  "difference_cents":-100}
+```
+
+- 列表按结算单生成时间从早到晚稳定排序；撤销后重新核销形成的多张结算单全部保留，旧单金额快照不变，可从结果还原核销时间线。
+- 对账核对的可观察结论：闭合时 `closed=true` 且 `discrepancies` 为空，`paid_cents == live_paid_cents` 且 `paid_cents + outstanding_cents == amount_cents`；未闭合时 `closed=false`，`discrepancies` 逐项标明核对项与差额。
+- 查询为只读：重复查询、查询后再发起结算或撤销，都不改变既有结算单、收款与订单状态；重启后同一查询返回一致结果。
 
 ## 金额闭合与并发语义
 

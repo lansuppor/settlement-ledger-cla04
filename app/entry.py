@@ -100,6 +100,33 @@ def reverse_payment(order_id: str, body: ReversalIn, x_tenant: str = Header(defa
         raise HTTPException(status_code=404, detail="order not found")
     return result
 
+@app.get("/orders/{order_id}/settlements")
+def list_order_settlements(order_id: str, status: str = "all", x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if status not in ("all", "active", "revoked"):
+        raise HTTPException(status_code=400, detail="status must be one of: active, revoked, all")
+    rows = settlements.list_for_order(x_tenant, order_id, None if status == "all" else status)
+    if rows is None:
+        # 订单不存在/跨租户点名统一按不存在处理，不泄漏对象是否存在
+        raise HTTPException(status_code=404, detail="order not found")
+    return {
+        "tenant": x_tenant,
+        "order_id": order_id,
+        "status_filter": status,
+        "settlements": [_settlement_response(row) for row in rows],
+    }
+
+@app.get("/orders/{order_id}/reconciliation")
+def reconcile_order(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    result = settlements.reconcile(x_tenant, order_id)
+    if result is None:
+        # 订单不存在/跨租户点名统一按不存在处理，不泄漏对象是否存在
+        raise HTTPException(status_code=404, detail="order not found")
+    return result
+
 @app.post("/orders/{order_id}/settlements", status_code=201)
 def settle_order(order_id: str, body: SettlementIn, x_tenant: str = Header(default="")) -> dict:
     if not x_tenant:
@@ -146,7 +173,7 @@ def _settlement_response(view: dict) -> dict:
         "status": view["status"],
         "created_at": view["created_at"],
         "revoked_at": view["revoked_at"],
-        **({"revocation_id": view["revocation_id"]} if "revocation_id" in view else {}),
+        **({"revocation_id": view["revocation_id"]} if view.get("revocation_id") is not None else {}),
     }
 
 @app.post("/payment-imports")

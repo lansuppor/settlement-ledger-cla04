@@ -184,6 +184,94 @@ def revoke(tenant: str, settlement_id: str, revocation_id: str) -> dict:
     return _revocation_view(tenant, settlement_id, revocation_id)
 
 
+def list_for_order(tenant: str, order_id: str, status: str | None = None) -> list[dict] | None:
+    """按订单列出结算单（核销时间线），按生成时间从早到晚稳定排序（rowid 兜底同毫秒并列）。
+
+    status 为 None 时返回全部（含已撤销），否则只返回对应状态；过滤只影响返回范围。
+    订单不存在（含跨租户点名）返回 None。只读，不改变任何单据状态与金额。
+    """
+    conn = connect()
+    try:
+        order = conn.execute(
+            "SELECT 1 FROM orders WHERE tenant=? AND order_id=?",
+            (tenant, order_id),
+        ).fetchone()
+        if order is None:
+            return None
+        where = "WHERE s.tenant=? AND s.order_id=?"
+        params: list = [tenant, order_id]
+        if status is not None:
+            where += " AND s.status=?"
+            params.append(status)
+        rows = conn.execute(
+            "SELECT s.tenant, s.settlement_id, s.settlement_key, s.order_id, s.amount_cents, "
+            "s.status, s.created_at, s.revoked_at, r.revocation_id "
+            "FROM settlements s "
+            "LEFT JOIN settlement_revocations r "
+            "ON r.tenant=s.tenant AND r.settlement_id=s.settlement_id "
+            f"{where} ORDER BY s.created_at ASC, s.rowid ASC",
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def reconcile(tenant: str, order_id: str) -> dict | None:
+    """对账核对：订单金额、账面已收、未冲正收款合计、未收金额与闭合结论。
+
+    闭合不变量：账面已收 == 未被冲正的收款合计；账面已收 + 未收 == 订单金额。
+    任一不成立时 closed=False 并在 discrepancies 中给出差异所在。
+    订单不存在（含跨租户点名）返回 None。只读。
+    """
+    conn = connect()
+    try:
+        order = conn.execute(
+            "SELECT amount_cents, paid_cents, currency, status FROM orders WHERE tenant=? AND order_id=?",
+            (tenant, order_id),
+        ).fetchone()
+        if order is None:
+            return None
+        live_total = conn.execute(
+            "SELECT COALESCE(SUM(p.amount_cents),0) AS s FROM payments p "
+            "WHERE p.tenant=? AND p.order_id=? AND NOT EXISTS ("
+            "SELECT 1 FROM reversals v WHERE v.tenant=p.tenant AND v.order_id=p.order_id "
+            "AND v.payment_id=p.payment_id)",
+            (tenant, order_id),
+        ).fetchone()["s"]
+    finally:
+        conn.close()
+
+    outstanding = order["amount_cents"] - order["paid_cents"]
+    discrepancies: list[dict] = []
+    if order["paid_cents"] != live_total:
+        # 账面已收与未被冲正的收款合计对不上：说明差异方向与差额
+        discrepancies.append({
+            "check": "paid_equals_live_payments",
+            "paid_cents": order["paid_cents"],
+            "live_paid_cents": live_total,
+            "difference_cents": order["paid_cents"] - live_total,
+        })
+    if order["paid_cents"] + outstanding != order["amount_cents"]:
+        discrepancies.append({
+            "check": "paid_plus_outstanding_equals_amount",
+            "paid_cents": order["paid_cents"],
+            "outstanding_cents": outstanding,
+            "amount_cents": order["amount_cents"],
+            "difference_cents": order["paid_cents"] + outstanding - order["amount_cents"],
+        })
+    return {
+        "tenant": tenant,
+        "order_id": order_id,
+        "amount_cents": order["amount_cents"],
+        "paid_cents": order["paid_cents"],
+        "live_paid_cents": live_total,
+        "outstanding_cents": outstanding,
+        "closed": not discrepancies,
+        "discrepancies": discrepancies,
+    }
+
+
 def get(tenant: str, settlement_id: str) -> dict | None:
     conn = connect()
     try:
