@@ -1,0 +1,4 @@
+tenant,order_id,amount_cents,currency
+t1,demo-1,1200,CNY
+t1,demo-2,800,CNY
+t2,demo-3,4500,USD

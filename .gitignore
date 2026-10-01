@@ -1,0 +1,57 @@
+# 构建与打包产物（按目录忽略）
+.build/
+build/
+dist/
+out/
+target/
+bin/
+obj/
+*.egg-info/
+.eggs/
+wheels/
+# 语言与工具缓存
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+node_modules/
+# 编译中间产物
+*.o
+*.a
+*.so
+*.dylib
+*.class
+# 覆盖率
+coverage/
+.coverage
+htmlcov/
+*.lcov
+junit.xml
+# 运行期数据、日志与临时文件
+var/
+tmp/
+logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.pid
+*.sock
+# 本地配置与凭据
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+# 编辑器与系统
+.idea/
+.vscode/
+.DS_Store
