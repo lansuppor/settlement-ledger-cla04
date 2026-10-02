@@ -13,6 +13,7 @@ ENTRY_REFUND = "refund"
 ENTRY_SETTLEMENT = "settlement"
 ENTRY_REVERSAL = "reversal"
 ENTRY_WRITEOFF = "writeoff"
+ENTRY_PAYMENT_REVERSAL = "payment_reversal"
 
 
 def next_seq(conn: sqlite3.Connection, tenant: str, order_id: str) -> int:

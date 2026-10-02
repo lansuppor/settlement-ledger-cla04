@@ -71,6 +71,35 @@ def apply_payment(conn: sqlite3.Connection, tenant: str, order_id: str, amount_c
             break
 
 
+def release_payment(conn: sqlite3.Connection, tenant: str, order_id: str, amount_cents: int) -> None:
+    # 收款撤销：按欠款编号逆序从该笔收款占用的核销尾部释放（与收款升序占用互为镜像），
+    # 较早的欠款优先保留核销；释放后“已核销金额之和”随订单已收等额下降。
+    # 调用方已保证 amount_cents <= 被撤销收款净额，且 Σ已核销 = 订单已收 >= 该净额，
+    # 故各条目已核销金额之和足以覆盖本次释放，循环结束恰好释放完。
+    remaining = amount_cents
+    rows = conn.execute(
+        "SELECT debt_no, settled_cents FROM debt_entries"
+        " WHERE tenant=? AND order_id=? AND settled_cents > 0 ORDER BY debt_no DESC",
+        (tenant, order_id),
+    ).fetchall()
+    for row in rows:
+        take = min(row["settled_cents"], remaining)
+        conn.execute(
+            "UPDATE debt_entries SET settled_cents = settled_cents - ?"
+            " WHERE tenant=? AND order_id=? AND debt_no=?",
+            (take, tenant, order_id, row["debt_no"]),
+        )
+        remaining -= take
+        if remaining == 0:
+            break
+    # 释放后各条目状态随未核销余额正确回到未核销或保持已核销。
+    conn.execute(
+        "UPDATE debt_entries SET status = CASE WHEN settled_cents >= amount_cents THEN 'settled' ELSE 'unsettled' END"
+        " WHERE tenant=? AND order_id=?",
+        (tenant, order_id),
+    )
+
+
 def _writeoff_view(row: sqlite3.Row) -> dict:
     # 幂等响应始终呈现首次生效时的快照：目标条目核销后的已核销/未核销金额、
     # 该订单核销后仍未核销的欠款合计都从登记快照常量化返回。

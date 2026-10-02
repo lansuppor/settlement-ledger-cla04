@@ -118,6 +118,12 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
         ).fetchone()["n"]
         # 收款按欠款编号升序自动占用各条目未核销余额，与订单金额同事务生效。
         debts.apply_payment(conn, tenant, order_id, amount_cents)
+        # 收款台账行（业务标识 pay-<序号>）与账务历史 biz_ref 一致，供收款撤销按笔定位。
+        conn.execute(
+            "INSERT INTO payments(tenant, order_id, pay_no, biz_ref, amount_cents, reversed_cents, currency)"
+            " VALUES(?,?,?,?,?,0,?)",
+            (tenant, order_id, pay_no, f"pay-{pay_no}", amount_cents, row["currency"]),
+        )
         ledger.append(
             conn, tenant, order_id, f"pay-{pay_no}", ledger.ENTRY_PAYMENT, amount_cents, outstanding_after
         )
