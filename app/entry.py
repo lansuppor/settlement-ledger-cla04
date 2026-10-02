@@ -1,12 +1,18 @@
 import argparse
-from fastapi import FastAPI, Header, HTTPException, Response
+import time
+
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-from app.config import tenant_header
-from app.store import orders
-from app.store.db import connect, migrate
+
+from app.config import cursor_ttl_seconds
+from app.rules import cursor as cursors
 from app.rules import order_rules
+from app.store import imports, orders
+from app.store.db import connect, migrate
 
 app = FastAPI(title="settlement-ledger")
+
+ORDER_STATUSES = ("accepted", "settled")
 
 class OrderIn(BaseModel):
     tenant: str = Field(min_length=1)
@@ -20,6 +26,12 @@ class PaymentIn(BaseModel):
 class RefundIn(BaseModel):
     refund_id: str = Field(min_length=1)
     amount_cents: int = Field(gt=0)
+
+class ImportIn(BaseModel):
+    tenant: str = Field(min_length=1)
+    batch_id: str = Field(min_length=1)
+    # 行内容逐行校验、部分成功，这里不做整批预校验。
+    rows: list[dict] = Field(default_factory=list)
 
 @app.get("/health")
 def health() -> dict:
@@ -40,6 +52,60 @@ def create_order(body: OrderIn) -> dict:
             raise HTTPException(status_code=409, detail="order already accepted")
         raise
     return orders.get(body.tenant, body.order_id)
+
+@app.post("/orders/import", status_code=202)
+def import_orders(body: ImportIn) -> dict:
+    try:
+        return imports.submit(body.tenant, body.batch_id, body.rows)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+
+@app.get("/orders/import/{batch_id}")
+def import_status(batch_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    batch = imports.get_batch(x_tenant, batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="batch not found")
+    return batch
+
+@app.get("/orders")
+def search_orders(
+    order_id_prefix: str | None = None,
+    status: str | None = None,
+    min_paid_cents: int | None = None,
+    page_size: int = 50,
+    cursor: str | None = None,
+    x_tenant: str = Header(default=""),
+) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if status is not None and status not in ORDER_STATUSES:
+        raise HTTPException(status_code=400, detail="unsupported status")
+    if min_paid_cents is not None and min_paid_cents < 0:
+        raise HTTPException(status_code=400, detail="min_paid_cents must be non-negative")
+    filters = {"order_id_prefix": order_id_prefix, "status": status, "min_paid_cents": min_paid_cents}
+    after = None
+    if cursor is not None:
+        # 游标只在同租户、同过滤条件且未过期时有效，各类失败原因可区分。
+        try:
+            data = cursors.decode(cursor)
+        except cursors.CursorError as error:
+            raise HTTPException(status_code=400, detail=error.reason)
+        if data["tenant"] != x_tenant:
+            raise HTTPException(status_code=400, detail="cursor_tenant_mismatch")
+        if time.time() - float(data["iat"]) > cursor_ttl_seconds():
+            raise HTTPException(status_code=400, detail="cursor_expired")
+        if data["filters"] != filters:
+            raise HTTPException(status_code=400, detail="cursor_filter_mismatch")
+        after = data["last"]
+    page, has_more = orders.search(x_tenant, order_id_prefix, status, min_paid_cents, page_size, after)
+    next_cursor = None
+    if has_more and page:
+        next_cursor = cursors.encode(
+            {"v": 1, "tenant": x_tenant, "filters": filters, "last": page[-1]["order_id"], "iat": time.time()}
+        )
+    return {"tenant": x_tenant, "orders": page, "next_cursor": next_cursor}
 
 @app.get("/orders/{order_id}")
 def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) -> dict:
@@ -81,6 +147,7 @@ def main() -> None:
     parser.add_argument("--migrate", action="store_true")
     args = parser.parse_args()
     migrate()
+    imports.resume_incomplete()
     if args.migrate:
         print("migrated")
         return

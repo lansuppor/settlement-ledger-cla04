@@ -1,5 +1,8 @@
 import sqlite3
+
 from app.store.db import connect
+
+MAX_PAGE_SIZE = 200
 
 def _shape(row: sqlite3.Row) -> dict:
     # 未收金额 = 订单金额 − 已收金额 + 已退金额（退款部分重新回到待收状态）
@@ -14,6 +17,47 @@ def _shape(row: sqlite3.Row) -> dict:
         "status": row["status"],
         "outstanding_cents": outstanding,
     }
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+def search(
+    tenant: str,
+    prefix: str | None = None,
+    status: str | None = None,
+    min_paid_cents: int | None = None,
+    page_size: int = 50,
+    after: str | None = None,
+) -> tuple[list[dict], bool]:
+    # 租户内组合过滤，按订单标识升序做键集分页（order_id > 锚点），
+    # 相同条件下分页稳定、不重不漏；页大小超过上限按上限截断。
+    clauses = ["tenant=?"]
+    params: list = [tenant]
+    if prefix:
+        clauses.append("order_id LIKE ? ESCAPE '\\'")
+        params.append(_escape_like(prefix) + "%")
+    if status:
+        clauses.append("status=?")
+        params.append(status)
+    if min_paid_cents is not None:
+        clauses.append("paid_cents>=?")
+        params.append(min_paid_cents)
+    if after is not None:
+        clauses.append("order_id>?")
+        params.append(after)
+    size = max(1, min(page_size, MAX_PAGE_SIZE))
+    sql = (
+        "SELECT tenant, order_id, amount_cents, paid_cents, refunded_cents, currency, status "
+        f"FROM orders WHERE {' AND '.join(clauses)} ORDER BY order_id ASC LIMIT ?"
+    )
+    params.append(size + 1)
+    conn = connect()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    has_more = len(rows) > size
+    return [_shape(row) for row in rows[:size]], has_more
 
 def insert(tenant: str, order_id: str, amount_cents: int, currency: str) -> None:
     conn = connect()

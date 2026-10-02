@@ -1,7 +1,11 @@
-import os, tempfile
+import os
+import tempfile
+
 os.environ.setdefault("APP_DB", os.path.join(tempfile.mkdtemp(), "test.sqlite"))
 from concurrent.futures import ThreadPoolExecutor
+
 from fastapi.testclient import TestClient
+
 from app.entry import app
 from app.store import orders
 from app.store.db import connect, migrate
