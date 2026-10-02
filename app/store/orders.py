@@ -1,5 +1,6 @@
 import sqlite3
 
+from app.store import ledger
 from app.store.db import connect
 
 MAX_PAGE_SIZE = 200
@@ -87,7 +88,7 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT amount_cents, paid_cents, refunded_cents FROM orders WHERE tenant=? AND order_id=?",
+            "SELECT amount_cents, paid_cents, refunded_cents, currency FROM orders WHERE tenant=? AND order_id=?",
             (tenant, order_id),
         ).fetchone()
         if row is None:
@@ -97,9 +98,19 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
         if amount_cents <= 0 or row["paid_cents"] + amount_cents > row["amount_cents"] + row["refunded_cents"]:
             conn.execute("ROLLBACK")
             raise ValueError("payment exceeds outstanding amount")
+        paid_after = row["paid_cents"] + amount_cents
+        outstanding_after = row["amount_cents"] - paid_after + row["refunded_cents"]
         conn.execute(
             "UPDATE orders SET paid_cents = paid_cents + ?, status = CASE WHEN paid_cents + ? >= amount_cents + refunded_cents THEN 'settled' ELSE 'accepted' END WHERE tenant=? AND order_id=?",
             (amount_cents, amount_cents, tenant, order_id),
+        )
+        # 收款与流水同事务落库：账务历史可逐笔重放，失败整体回滚不留半截记录。
+        pay_no = conn.execute(
+            "SELECT COUNT(*) + 1 AS n FROM ledger_entries WHERE tenant=? AND order_id=? AND entry_type='payment'",
+            (tenant, order_id),
+        ).fetchone()["n"]
+        ledger.append(
+            conn, tenant, order_id, f"pay-{pay_no}", ledger.ENTRY_PAYMENT, amount_cents, outstanding_after
         )
         conn.execute("COMMIT")
     finally:
@@ -139,6 +150,16 @@ def add_refund(tenant: str, order_id: str, refund_id: str, amount_cents: int) ->
         if amount_cents <= 0 or amount_cents > refundable:
             conn.execute("ROLLBACK")
             raise ValueError("refund exceeds refundable amount")
+        # 存在生效结算时订单账务已闭合：退款（会回冲未收并退回未结算状态）必须先冲正结算，
+        # 否则会出现“生效结算仍在、订单却未结清”的状态不一致。注意历史上仅凭全额收款
+        # 进入 settled 状态而无结算记录的订单不受此限（settlements 中无 effective 行）。
+        locked = conn.execute(
+            "SELECT 1 FROM settlements WHERE tenant=? AND order_id=? AND status='effective'",
+            (tenant, order_id),
+        ).fetchone()
+        if locked is not None:
+            conn.execute("ROLLBACK")
+            raise ValueError("order is settled; reverse the settlement before refunding")
         paid_after = row["paid_cents"]
         refunded_after = row["refunded_cents"] + amount_cents
         outstanding_after = row["amount_cents"] - paid_after + refunded_after
@@ -165,6 +186,10 @@ def add_refund(tenant: str, order_id: str, refund_id: str, amount_cents: int) ->
         except sqlite3.IntegrityError:
             conn.execute("ROLLBACK")
             raise ValueError("refund_id already used")
+        # 5) 订单账务历史追加退款条目，业务标识即调用方提供的退款标识。
+        ledger.append(
+            conn, tenant, order_id, refund_id, ledger.ENTRY_REFUND, amount_cents, outstanding_after
+        )
         conn.execute("COMMIT")
     finally:
         conn.close()
