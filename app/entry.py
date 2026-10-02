@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from app.config import cursor_ttl_seconds
 from app.rules import cursor as cursors
 from app.rules import order_rules
-from app.store import imports, ledger, orders, reconciliations, settlements, tickets
+from app.store import imports, ledger, orders, reconciliations, settlements, tickets, writeoffs
 from app.store.db import connect, migrate
 
 app = FastAPI(title="settlement-ledger")
@@ -62,6 +62,11 @@ class TicketIn(BaseModel):
 class TicketProcessIn(BaseModel):
     status: str = Field(min_length=1)
     note: str | None = None
+
+class WriteOffIn(BaseModel):
+    write_off_id: str = Field(min_length=1)
+    debt_no: int = Field(gt=0)
+    amount_cents: int = Field(gt=0)
 
 @app.get("/health")
 def health() -> dict:
@@ -208,6 +213,30 @@ def order_ledger(order_id: str, x_tenant: str = Header(default="")) -> dict:
     if entries is None:
         raise HTTPException(status_code=404, detail="order not found")
     return {"tenant": x_tenant, "order_id": order_id, "entries": entries}
+
+@app.post("/orders/{order_id}/write-offs", status_code=201)
+def write_off_order(order_id: str, body: WriteOffIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        result = writeoffs.write_off(
+            x_tenant, order_id, body.write_off_id, body.debt_no, body.amount_cents
+        )
+    except writeoffs.Conflict as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    if result is None:
+        # 订单或欠款条目不存在、跨租户统一按不存在处理，不泄漏对象是否存在。
+        raise HTTPException(status_code=404, detail="order or debt item not found")
+    return result
+
+@app.get("/orders/{order_id}/debt-items")
+def list_debt_items(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    items = writeoffs.list_items(x_tenant, order_id)
+    if items is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return {"tenant": x_tenant, "order_id": order_id, "items": items}
 
 @app.post("/reconciliations", status_code=201)
 def start_reconciliation(body: ReconciliationIn) -> dict:

@@ -1,6 +1,6 @@
 import sqlite3
 
-from app.store import ledger
+from app.store import ledger, writeoffs
 from app.store.db import connect
 
 MAX_PAGE_SIZE = 200
@@ -63,10 +63,18 @@ def search(
 def insert(tenant: str, order_id: str, amount_cents: int, currency: str) -> None:
     conn = connect()
     try:
-        conn.execute(
-            "INSERT INTO orders(tenant, order_id, amount_cents, paid_cents, currency, status) VALUES(?,?,?,0,?,'accepted')",
-            (tenant, order_id, amount_cents, currency),
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "INSERT INTO orders(tenant, order_id, amount_cents, paid_cents, currency, status) VALUES(?,?,?,0,?,'accepted')",
+                (tenant, order_id, amount_cents, currency),
+            )
+            # 受理同时生成第一条欠款条目（欠款编号 1，金额 = 受理时订单金额），同事务落库。
+            writeoffs.append_item(conn, tenant, order_id, amount_cents)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
     finally:
         conn.close()
 
@@ -190,6 +198,8 @@ def add_refund(tenant: str, order_id: str, refund_id: str, amount_cents: int) ->
         ledger.append(
             conn, tenant, order_id, refund_id, ledger.ENTRY_REFUND, amount_cents, outstanding_after
         )
+        # 6) 退款成功生成新的欠款条目（金额 = 该笔退回金额，状态未核销），同事务落库。
+        writeoffs.append_item(conn, tenant, order_id, amount_cents)
         conn.execute("COMMIT")
     finally:
         conn.close()
