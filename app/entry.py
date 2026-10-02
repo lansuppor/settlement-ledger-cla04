@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from app.config import cursor_ttl_seconds
 from app.rules import cursor as cursors
 from app.rules import order_rules
-from app.store import imports, orders
+from app.store import imports, ledger, orders, reconciliations, settlements
 from app.store.db import connect, migrate
 
 app = FastAPI(title="settlement-ledger")
@@ -32,6 +32,18 @@ class ImportIn(BaseModel):
     batch_id: str = Field(min_length=1)
     # 行内容逐行校验、部分成功，这里不做整批预校验。
     rows: list[dict] = Field(default_factory=list)
+
+class SettlementIn(BaseModel):
+    settlement_id: str = Field(min_length=1)
+    amount_cents: int = Field(gt=0)
+
+class ReversalIn(BaseModel):
+    reversal_id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+class ReconciliationIn(BaseModel):
+    tenant: str = Field(min_length=1)
+    reconciliation_id: str = Field(min_length=1)
 
 @app.get("/health")
 def health() -> dict:
@@ -139,6 +151,53 @@ def add_refund(order_id: str, body: RefundIn, x_tenant: str = Header(default="")
         raise HTTPException(status_code=409, detail=str(error))
     if result is None:
         raise HTTPException(status_code=404, detail="order not found")
+    return result
+
+@app.post("/orders/{order_id}/settlements")
+def settle_order(order_id: str, body: SettlementIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        result = settlements.settle(x_tenant, order_id, body.settlement_id, body.amount_cents)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    if result is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return result
+
+@app.post("/orders/{order_id}/reversals")
+def reverse_order(order_id: str, body: ReversalIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        result = settlements.reverse(x_tenant, order_id, body.reversal_id, body.reason)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    if result is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return result
+
+@app.get("/orders/{order_id}/ledger")
+def order_ledger(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    result = ledger.history(x_tenant, order_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return result
+
+@app.post("/reconciliations", status_code=201)
+def create_reconciliation(body: ReconciliationIn) -> dict:
+    # 同一对账标识重复发起返回与首次一致的已落库汇总，不重复计算。
+    return reconciliations.reconcile(body.tenant, body.reconciliation_id)
+
+@app.get("/reconciliations/{reconciliation_id}")
+def read_reconciliation(reconciliation_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    result = reconciliations.get(x_tenant, reconciliation_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="reconciliation not found")
     return result
 
 def main() -> None:

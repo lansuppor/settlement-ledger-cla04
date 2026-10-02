@@ -4,7 +4,7 @@ from pathlib import Path
 from app.config import db_path
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MIGRATIONS = ("001_init.sql", "002_refunds.sql", "003_imports.sql")
+MIGRATIONS = ("001_init.sql", "002_refunds.sql", "003_imports.sql", "004_settlements.sql")
 
 def connect() -> sqlite3.Connection:
     path = db_path()

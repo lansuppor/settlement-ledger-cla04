@@ -1,5 +1,6 @@
 import sqlite3
 
+from app.store import ledger
 from app.store.db import connect
 
 MAX_PAGE_SIZE = 200
@@ -101,6 +102,11 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
             "UPDATE orders SET paid_cents = paid_cents + ?, status = CASE WHEN paid_cents + ? >= amount_cents + refunded_cents THEN 'settled' ELSE 'accepted' END WHERE tenant=? AND order_id=?",
             (amount_cents, amount_cents, tenant, order_id),
         )
+        # 收款流水与金额变更同事务：收款无调用方标识，生成 pm-<序号> 作为业务标识。
+        outstanding_after = row["amount_cents"] - row["paid_cents"] - amount_cents + row["refunded_cents"]
+        ledger.record_entry(
+            conn, tenant, order_id, ledger.next_payment_id(conn), "payment", amount_cents, outstanding_after
+        )
         conn.execute("COMMIT")
     finally:
         conn.close()
@@ -165,6 +171,8 @@ def add_refund(tenant: str, order_id: str, refund_id: str, amount_cents: int) ->
         except sqlite3.IntegrityError:
             conn.execute("ROLLBACK")
             raise ValueError("refund_id already used")
+        # 退款流水与金额变更同事务，业务标识即退款标识。
+        ledger.record_entry(conn, tenant, order_id, refund_id, "refund", amount_cents, outstanding_after)
         conn.execute("COMMIT")
     finally:
         conn.close()
