@@ -62,6 +62,48 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
         conn.close()
     return get(tenant, order_id)
 
+def search(
+    tenant: str,
+    prefix: str | None,
+    status: str | None,
+    min_paid_cents: int | None,
+    limit: int,
+    after_order_id: str | None,
+) -> tuple[list[dict], str | None, bool]:
+    """单租户内组合过滤，按订单标识升序做键集分页（不重不漏、同条件稳定）。
+
+    返回 (本页订单, 本页最后一笔的订单标识, 是否还有下一页)。
+    """
+    sql = (
+        "SELECT tenant, order_id, amount_cents, paid_cents, refunded_cents, currency, status"
+        " FROM orders WHERE tenant=?"
+    )
+    params: list = [tenant]
+    if prefix:
+        sql += " AND substr(order_id, 1, ?) = ?"
+        params += [len(prefix), prefix]
+    if status:
+        sql += " AND status=?"
+        params.append(status)
+    if min_paid_cents is not None:
+        sql += " AND paid_cents >= ?"
+        params.append(min_paid_cents)
+    if after_order_id is not None:
+        sql += " AND order_id > ?"
+        params.append(after_order_id)
+    sql += " ORDER BY order_id ASC LIMIT ?"
+    params.append(limit + 1)  # 多取一行判断是否还有下一页
+    conn = connect()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    last_order_id = page[-1]["order_id"] if page else after_order_id
+    return [_shape(row) for row in page], last_order_id, has_more
+
+
 def _refund_result(paid_cents: int, refunded_cents: int, outstanding_cents: int) -> dict:
     return {
         "paid_cents": paid_cents,
