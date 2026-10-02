@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款、按笔登记退款、收款核销（逐笔核销到指定欠款条目）、批量导入订单、条件检索、订单结算与冲正、订单账务历史与按租户对账核销，并核对未收金额；同时支持针对订单各环节问题的工单登记、处理与检索，形成从受理到处理完成的闭环；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款、撤销收款（账务冲回，非退款）、按笔登记退款、收款核销（逐笔核销到指定欠款条目）、批量导入订单、条件检索、订单结算与冲正、订单账务历史与按租户对账核销，并核对未收金额；同时支持针对订单各环节问题的工单登记、处理与检索，形成从受理到处理完成的闭环；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -24,13 +24,14 @@
 - `GET /orders/import/{batch_id}`：查询批次进度与结果。租户通过请求头 `X-Tenant` 传入；不存在或跨租户返回 404。返回 `status`（`processing`/`completed`）、`total_rows`、`processed_rows`、`success_count`、`failure_count` 与 `failures`（每个失败行的 `row_no`、`order_id`、`error`）。
 - `GET /orders`：条件检索。租户通过请求头 `X-Tenant` 传入，结果严格限定在该租户内。查询参数均可选、可任意组合：`order_id_prefix`（订单标识前缀）、`status`（`accepted`/`settled`）、`min_paid_cents`（已收金额下限）、`page_size`（每页条数，默认 50，上限 200，超过按上限截断）、`cursor`（下一页游标）。按订单标识升序返回 `{orders, next_cursor}`；`next_cursor` 为 null 表示没有下一页。游标只在同租户、同过滤条件下有效，非法、跨租户、换过滤条件、过期的游标分别返回 400 与可区分的原因：`cursor_malformed`、`cursor_tenant_mismatch`、`cursor_filter_mismatch`、`cursor_expired`。
 - `GET /orders/{order_id}`：按标识读取订单。租户通过请求头 `X-Tenant` 传入；不存在返回 404；跨租户读取返回 404（不泄漏对象是否存在）。
-- `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`；超过未收金额返回 409；成功返回 200 与订单的 `paid_cents`、`outstanding_cents`。
+- `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`；超过未收金额返回 409；成功返回 200 与订单的 `paid_cents`、`outstanding_cents`。每笔收款以业务标识 `pay-<订单内收款序号>`（如 `pay-1`）登记，该标识在订单账务历史中可查，撤销收款时按它定位。
+- `POST /orders/{order_id}/payments/reversals`：撤销收款（账务冲回，非退款）。租户通过请求头 `X-Tenant` 传入；请求字段 `reversal_id`（撤销标识，调用方提供，同一租户内唯一）、`payment_ref`（被撤销收款的业务标识，即账务历史中的 `pay-<收款序号>`）、`amount_cents`（正整数，可全额或部分）。成功返回 200 与撤销结果：`reversal_id`、`payment_ref`、`amount_cents`、`payment_net_cents`（撤销后该笔收款净额＝原收款金额−累计已撤销）、订单的 `paid_cents`、`refunded_cents`、`outstanding_cents` 与 `status`。已收随撤销等额减少、未收等额增加、已退不变；撤销后未收大于 0 时订单回到待收。同一撤销标识对同一收款、同一金额重复提交返回与首次一致的结果，不重复冲回；同标识换收款标识或换金额返回 409；累计撤销超过该笔收款净额时整笔拒绝（409）且不产生任何记录；订单存在生效结算时拒绝撤销（409，须先冲正结算）；被撤销收款不存在、订单不存在或跨租户返回 404（不泄漏对象是否存在）；缺少租户头/参数不合法返回 400。撤销同步按欠款编号逆序从该笔收款占用的尾部释放核销金额，不删除原收款流水，改为在账务历史追加一条 `payment_reversal` 条目；撤销后可正常再收款，退款仍以撤销后的已收净额为上限。
 - `POST /orders/{order_id}/refunds`：按笔登记退款。租户通过请求头 `X-Tenant` 传入；请求字段 `refund_id`（调用方提供，同一租户内唯一）、`amount_cents`。成功返回 200 与订单的 `paid_cents`、`refunded_cents`、`outstanding_cents`；同一退款标识重复提交返回与首次一致的结果（不重复扣减）；不同订单复用同一退款标识返回 409；退款超过当前可退净额（已收 − 已退）返回 409；订单存在生效结算时返回 409（须先冲正结算）；订单不存在或跨租户返回 404（不泄漏对象是否存在）；缺少租户头/参数不合法返回 400。
 - `POST /orders/{order_id}/writeoffs`：收款核销，把一笔已到账金额逐笔核销到指定欠款条目。租户通过请求头 `X-Tenant` 传入；请求字段 `writeoff_id`（核销标识，调用方提供，同一租户内唯一）、`debt_no`（订单内欠款编号，从 1 开始）、`amount_cents`（正整数）。成功返回 201 与核销结果：`writeoff_id`、`order_id`、`debt_no`、`amount_cents`、目标条目核销后的 `settled_cents`（已核销金额）、`remaining_cents`（该条目未核销余额）、`remaining_total_cents`（该订单核销后仍未核销的欠款合计，恒等于订单未收金额）与条目 `status`（`unsettled`/`settled`）。同一核销标识对同一订单、同一欠款编号、同一金额重复提交返回与首次一致的结果，不重复核销；同标识换订单、换欠款编号或换金额返回 409。核销金额超过该条目当前未核销余额、或没有对应的到账金额可核销时整笔拒绝（409）且不产生任何记录；订单存在生效结算时拒绝核销（409，须先冲正结算）；订单或欠款编号不存在、跨租户返回 404（不泄漏对象是否存在）；缺少租户头/参数不合法返回 400。核销不改变订单的已收、已退、未收金额与订单状态：核销只是把已到账款项从收款时按编号自动占用的条目改配到指定条目。
 - `GET /orders/{order_id}/debts`：按订单查询欠款条目。租户通过请求头 `X-Tenant` 传入；按欠款编号升序返回每条的 `debt_no`、`amount_cents`（欠款金额）、`settled_cents`（已核销金额）、`remaining_cents`（未核销余额）与 `status`。订单受理时生成第 1 条（金额等于订单金额）；每笔退款成功后追加一条（金额等于退回金额），条目金额一经生成不再变化。恒有 欠款金额之和 = 订单金额 + 已退金额、未核销余额之和 = 订单未收金额。订单不存在或跨租户返回 404；缺少租户头返回 400。
 - `POST /orders/{order_id}/settlements`：发起结算。租户通过请求头 `X-Tenant` 传入；请求字段 `settlement_id`（调用方提供，同一租户内唯一）、`amount_cents`（结算金额）。订单未收金额大于 0 返回 409，不产生任何账务或状态变化；成功返回 201 与结算记录（含结算金额、结算时已收 `paid_cents`、已退 `refunded_cents`、未收恒为 0、结算代数 `seq`、`status: "effective"`），订单进入已结算状态。同一结算标识对同一订单、同一金额重复提交返回与首次一致的结果；同一标识用于不同订单或不同金额返回 409；订单不存在或跨租户返回 404。
 - `POST /orders/{order_id}/settlements/{settlement_id}/reversals`：冲正结算。请求字段 `reversal_id`（调用方提供，同一租户内唯一）、`reason`（原因文本，可空）。成功返回 201 与冲正记录，对应结算记录作废（`voided`），订单退回未结算状态；同一冲正标识重复提交返回与首次一致的结果；对同一结算重复冲正返回 409；结算不存在、不属于该订单或跨租户返回 404。冲正标识与结算标识是两个独立请求身份，可同名，互不去重。冲正后可凭新结算标识重新结算；同一订单任一时刻至多一条生效结算记录，历史记录保留可查。
-- `GET /orders/{order_id}/ledger`：订单账务历史。按时间与业务标识升序返回收款、退款、结算、冲正、核销条目，每条含 `biz_ref`（业务标识；收款无外部标识时为 `pay-<订单内收款序号>`、核销为核销标识）、`type`、`amount_cents`、`outstanding_cents`（操作后未收金额；核销条目中为核销后仍未核销的欠款合计）与时间。跨租户或订单不存在返回 404。按该序列逐笔重放即得到与订单读取接口一致的最终未收金额与状态。
+- `GET /orders/{order_id}/ledger`：订单账务历史。按时间与业务标识升序返回收款、退款、收款撤销、结算、冲正、核销条目，每条含 `biz_ref`（业务标识；收款为 `pay-<订单内收款序号>`、收款撤销为撤销标识、核销为核销标识）、`type`、`amount_cents`、`outstanding_cents`（操作后未收金额；核销条目中为核销后仍未核销的欠款合计）与时间。跨租户或订单不存在返回 404。按该序列逐笔重放（收款减未收、退款与收款撤销加未收）即得到与订单读取接口一致的最终未收金额与状态。
 - `POST /reconciliations`：按租户发起对账。请求字段 `tenant`、`reconciliation_id`（调用方提供，同一租户内唯一）。在单个事务内取该租户全部订单的一致性快照并落库，返回 201 与汇总：`order_count`、`total_receivable_cents`（应收合计）、`total_paid_cents`、`total_refunded_cents`、`total_outstanding_cents` 与逐订单行（含当前是否存在生效结算 `has_active_settlement`）。恒有 应收 = 已收 + 未收（未收沿用订单口径，含退款回冲），逐订单金额与 `GET /orders/{order_id}` 一致。同一对账标识重复发起返回与首次一致的汇总，不重复计算；对账期间新发生的账务不改变已生成结果，须以新标识重新发起才反映。
 - `GET /reconciliations/{reconciliation_id}`：查询对账汇总。租户通过请求头 `X-Tenant` 传入；不存在或跨租户返回 404。
 - `POST /tickets`：登记工单。请求字段 `tenant`、`ticket_id`（调用方提供，同一租户内唯一）、`order_id`、`ticket_type`（`accept`/`payment`/`refund`/`settlement`/`reversal`，对应受理、收款、退款、结算、冲正五类环节）、`description`（问题描述，不能为空）。成功返回 201 与工单对象（含工单标识、订单标识、工单类型、处理状态 `pending`、创建时间）；参数不合法返回 400；订单不存在或跨租户返回 404（不泄漏对象是否存在）。同一工单标识对同一订单、同一工单类型重复登记返回与首次一致的结果，不重复受理；同标识换订单或换工单类型返回 409。
@@ -54,6 +55,24 @@ curl -s -X POST localhost:8000/orders/demo-1/refunds \
 ```
 
 退款成功后退回的 200 重新计入未收金额，可再次收款；退款累计不得超过已收净额。订单存在生效结算期间不可退款，须先冲正结算。
+
+### 收款撤销调用示例
+
+```bash
+# 先收款 800（账务历史中该笔收款的业务标识为 pay-1）
+curl -s -X POST localhost:8000/orders/demo-1/payments \
+  -H 'X-Tenant: t1' -H 'Content-Type: application/json' -d '{"amount_cents": 800}'
+# 录单金额错误：按收款业务标识撤销 300（撤销标识由调用方生成，同一租户内唯一）
+curl -s -X POST localhost:8000/orders/demo-1/payments/reversals \
+  -H 'X-Tenant: t1' -H 'Content-Type: application/json' \
+  -d '{"reversal_id": "rv-20261003-0001", "payment_ref": "pay-1", "amount_cents": 300}'
+# => 200 {"reversal_id":"rv-20261003-0001","payment_ref":"pay-1","amount_cents":300,
+#         "payment_net_cents":500,"paid_cents":500,"refunded_cents":0,
+#         "outstanding_cents":300,"status":"accepted",...}
+# 同一撤销标识对同一收款、同一金额再次提交：原样返回首次结果，不重复冲回
+```
+
+撤销是账务冲回、不是退款：已收等额减少、未收等额增加、已退不变，订单未收大于 0 时回到待收。同一笔收款可用不同撤销标识分次部分撤销，但累计撤销不得超过其净额（原收款金额−累计已撤销），超出整笔拒绝（409）且不留记录。撤销按欠款编号逆序从该笔收款占用的尾部释放核销金额，原收款流水不删除，账务历史追加一条可辨识的 `payment_reversal` 条目。撤销后可就腾出的未收重新收款；退款仍以撤销后的已收净额为上限；存在生效结算时不可撤销，须先冲正结算。
 
 ### 收款核销调用示例
 
@@ -186,4 +205,4 @@ curl -s 'localhost:8000/orders?order_id_prefix=demo-&status=accepted&min_paid_ce
 - 单进程运行，单库写入，未做连接池与写并发调优。
 - 租户通过请求头声明，未接入真实身份提供方。
 - 无缓存层；批量导入为单进程内异步执行，重启后按批次标识续跑。
-- 收款支持按未收金额多笔登记、按笔退款、收款核销到指定欠款条目、结算与冲正、订单账务历史与按租户对账，未实现分期计划。
+- 收款支持按未收金额多笔登记、按笔撤销收款（账务冲回）、按笔退款、收款核销到指定欠款条目、结算与冲正、订单账务历史与按租户对账，未实现分期计划。

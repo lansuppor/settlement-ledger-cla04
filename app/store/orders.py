@@ -112,14 +112,22 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
             (amount_cents, amount_cents, tenant, order_id),
         )
         # 收款与流水同事务落库：账务历史可逐笔重放，失败整体回滚不留半截记录。
+        # pay_seq 取订单内已有收款序号最大值 +1（历史回填的 pay-0 不影响新序号，仍从 1 起）。
         pay_no = conn.execute(
-            "SELECT COUNT(*) + 1 AS n FROM ledger_entries WHERE tenant=? AND order_id=? AND entry_type='payment'",
+            "SELECT COALESCE(MAX(pay_seq), 0) + 1 AS n FROM payments WHERE tenant=? AND order_id=?",
             (tenant, order_id),
         ).fetchone()["n"]
-        # 收款按欠款编号升序自动占用各条目未核销余额，与订单金额同事务生效。
-        debts.apply_payment(conn, tenant, order_id, amount_cents)
+        payment_ref = f"pay-{pay_no}"
+        # 收款流水先于占用落库：payment_allocations 以外键引用 payments。
+        conn.execute(
+            "INSERT INTO payments(tenant, payment_ref, order_id, pay_seq, amount_cents, currency)"
+            " VALUES(?,?,?,?,?,?)",
+            (tenant, payment_ref, order_id, pay_no, amount_cents, row["currency"]),
+        )
+        # 收款按欠款编号升序自动占用各条目未核销余额，占用按笔落 payment_allocations。
+        debts.apply_payment(conn, tenant, order_id, payment_ref, amount_cents)
         ledger.append(
-            conn, tenant, order_id, f"pay-{pay_no}", ledger.ENTRY_PAYMENT, amount_cents, outstanding_after
+            conn, tenant, order_id, payment_ref, ledger.ENTRY_PAYMENT, amount_cents, outstanding_after
         )
         conn.execute("COMMIT")
     finally:

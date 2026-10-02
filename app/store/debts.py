@@ -14,6 +14,10 @@ from app.store.db import connect
 # 为使“已核销之和 = 已收金额”恒成立，收款登记按 debt_no 升序自动占用各条目余额；
 # 收款核销登记则把一笔已到账金额从其它条目自动占用的尾部空间改配（re-pin）到指定条目，
 # 订单的已收/已退/未收金额与状态均不变化。
+#
+# 每笔收款在各条目上的占用落在 payment_allocations：收款撤销时按欠款编号逆序只释放
+# 被撤销那笔收款的占用尾部，核销改配时占用随同一笔收款一起迁移，恒有
+# “一笔收款的占用合计 = 其净额（原金额 − 累计已撤销）”。
 
 ENTRY_DEBT_SETTLED = "settled"
 ENTRY_DEBT_UNSETTLED = "unsettled"
@@ -21,6 +25,15 @@ ENTRY_DEBT_UNSETTLED = "unsettled"
 
 class Conflict(ValueError):
     """业务冲突（409）。"""
+
+
+def _refresh_statuses(conn: sqlite3.Connection, tenant: str, order_id: str) -> None:
+    # 已核销余额为 0 即已核销，否则未核销；任何占用变动后统一按当前余额重算。
+    conn.execute(
+        "UPDATE debt_entries SET status = CASE WHEN settled_cents >= amount_cents THEN 'settled' ELSE 'unsettled' END"
+        " WHERE tenant=? AND order_id=?",
+        (tenant, order_id),
+    )
 
 
 def open_first(
@@ -49,9 +62,16 @@ def open_next(
     )
 
 
-def apply_payment(conn: sqlite3.Connection, tenant: str, order_id: str, amount_cents: int) -> None:
+def apply_payment(
+    conn: sqlite3.Connection,
+    tenant: str,
+    order_id: str,
+    payment_ref: str,
+    amount_cents: int,
+) -> None:
     # 收款登记：按欠款编号升序逐笔占用未核销余额（先入账的钱先核销最早的欠款）。
-    # 调用方已保证 amount_cents <= 订单未收 = 各条目余额之和，故循环结束恰好分完。
+    # 调用方已保证 amount_cents <= 订单未收 = 各条目余额之和，故循环结束恰好分完；
+    # 每个条目上的占用同步落 payment_allocations，供核销改配与收款撤销按笔追踪。
     remaining = amount_cents
     rows = conn.execute(
         "SELECT debt_no, amount_cents - settled_cents AS room FROM debt_entries"
@@ -66,9 +86,70 @@ def apply_payment(conn: sqlite3.Connection, tenant: str, order_id: str, amount_c
             " WHERE tenant=? AND order_id=? AND debt_no=?",
             (take, take, tenant, order_id, row["debt_no"]),
         )
+        conn.execute(
+            "INSERT INTO payment_allocations(tenant, order_id, payment_ref, debt_no, amount_cents)"
+            " VALUES(?,?,?,?,?)",
+            (tenant, order_id, payment_ref, row["debt_no"], take),
+        )
         remaining -= take
         if remaining == 0:
             break
+
+
+def release_payment(
+    conn: sqlite3.Connection,
+    tenant: str,
+    order_id: str,
+    payment_ref: str,
+    amount_cents: int,
+) -> None:
+    # 收款撤销：按欠款编号逆序从该笔收款占用的尾部释放（较晚的欠款条目先解占用，
+    # 较早条目的核销尽量保留）。调用方已保证 amount_cents <= 该收款占用合计（= 其净额），
+    # 故循环结束恰好释放完；释放后按余额重算各条目状态（回到未核销或保持已核销）。
+    remaining = amount_cents
+    rows = conn.execute(
+        "SELECT debt_no, amount_cents AS held FROM payment_allocations"
+        " WHERE tenant=? AND order_id=? AND payment_ref=? ORDER BY debt_no DESC",
+        (tenant, order_id, payment_ref),
+    ).fetchall()
+    for row in rows:
+        take = min(row["held"], remaining)
+        if take == row["held"]:
+            conn.execute(
+                "DELETE FROM payment_allocations"
+                " WHERE tenant=? AND order_id=? AND payment_ref=? AND debt_no=?",
+                (tenant, order_id, payment_ref, row["debt_no"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE payment_allocations SET amount_cents = amount_cents - ?"
+                " WHERE tenant=? AND order_id=? AND payment_ref=? AND debt_no=?",
+                (take, tenant, order_id, payment_ref, row["debt_no"]),
+            )
+        conn.execute(
+            "UPDATE debt_entries SET settled_cents = settled_cents - ?"
+            " WHERE tenant=? AND order_id=? AND debt_no=?",
+            (take, tenant, order_id, row["debt_no"]),
+        )
+        remaining -= take
+        if remaining == 0:
+            break
+    _refresh_statuses(conn, tenant, order_id)
+
+
+def _allocation_held(
+    conn: sqlite3.Connection,
+    tenant: str,
+    order_id: str,
+    payment_ref: str,
+    debt_no: int,
+) -> int:
+    row = conn.execute(
+        "SELECT amount_cents FROM payment_allocations"
+        " WHERE tenant=? AND order_id=? AND payment_ref=? AND debt_no=?",
+        (tenant, order_id, payment_ref, debt_no),
+    ).fetchone()
+    return 0 if row is None else row["amount_cents"]
 
 
 def _writeoff_view(row: sqlite3.Row) -> dict:
@@ -140,41 +221,58 @@ def register(
             raise Conflict("writeoff exceeds unsettled balance of the debt entry")
         # 6) 已核销之和恒等于已收金额：核销只改配已到账款项。可从其它条目释放的金额
         #    = 已收 − 目标条目当前已核销；不足时同样整笔拒绝（无对应到账金额可核销）。
-        #    按编号逆序从自动占用的尾部释放，较早的欠款优先保留核销。
+        #    按编号逆序从自动占用的尾部释放，较早的欠款优先保留核销；同一欠款条目内
+        #    再按收款序号逆序（最晚到账的钱先改配），使每笔收款的占用随改配一起迁移，
+        #    撤销时仍能按笔定位其占用尾部。
         freable_rows = conn.execute(
-            "SELECT debt_no, settled_cents FROM debt_entries"
-            " WHERE tenant=? AND order_id=? AND debt_no != ? AND settled_cents > 0"
-            " ORDER BY debt_no DESC",
+            "SELECT a.debt_no AS debt_no, a.payment_ref AS payment_ref, a.amount_cents AS held"
+            " FROM payment_allocations a"
+            " JOIN payments p ON p.tenant = a.tenant AND p.payment_ref = a.payment_ref"
+            " WHERE a.tenant=? AND a.order_id=? AND a.debt_no != ?"
+            " ORDER BY a.debt_no DESC, p.pay_seq DESC",
             (tenant, order_id, debt_no),
         ).fetchall()
         to_free = amount_cents
-        plan: list[tuple[int, int]] = []
+        plan: list[tuple[int, str, int]] = []
         for row in freable_rows:
-            take = min(row["settled_cents"], to_free)
-            plan.append((row["debt_no"], take))
+            take = min(row["held"], to_free)
+            plan.append((row["debt_no"], row["payment_ref"], take))
             to_free -= take
             if to_free == 0:
                 break
         if to_free > 0:
             conn.execute("ROLLBACK")
             raise Conflict("writeoff exceeds arrived amount available for the debt entry")
-        # 7) 同事务生效：先从其它条目释放，再加到目标条目（CHECK 约束兜底不超额）。
-        for other_no, take in plan:
+        # 7) 同事务生效：先从其它条目释放（占用明细随同一笔收款迁移），再加到目标条目
+        #    （CHECK 约束兜底不超额）；目标条目上同一收款已有占用时合并。
+        for other_no, payment_ref, take in plan:
+            if take == _allocation_held(conn, tenant, order_id, payment_ref, other_no):
+                conn.execute(
+                    "DELETE FROM payment_allocations"
+                    " WHERE tenant=? AND order_id=? AND payment_ref=? AND debt_no=?",
+                    (tenant, order_id, payment_ref, other_no),
+                )
+            else:
+                conn.execute(
+                    "UPDATE payment_allocations SET amount_cents = amount_cents - ?"
+                    " WHERE tenant=? AND order_id=? AND payment_ref=? AND debt_no=?",
+                    (take, tenant, order_id, payment_ref, other_no),
+                )
+            conn.execute(
+                "INSERT INTO payment_allocations(tenant, order_id, payment_ref, debt_no, amount_cents)"
+                " VALUES(?,?,?,?,?) ON CONFLICT DO UPDATE SET amount_cents = amount_cents + excluded.amount_cents",
+                (tenant, order_id, payment_ref, debt_no, take),
+            )
             conn.execute(
                 "UPDATE debt_entries SET settled_cents = settled_cents - ? WHERE tenant=? AND order_id=? AND debt_no=?",
                 (take, tenant, order_id, other_no),
             )
         conn.execute(
-            "UPDATE debt_entries SET settled_cents = settled_cents + ?,"
-            " status = CASE WHEN settled_cents + ? >= amount_cents THEN 'settled' ELSE status END"
+            "UPDATE debt_entries SET settled_cents = settled_cents + ?"
             " WHERE tenant=? AND order_id=? AND debt_no=?",
-            (amount_cents, amount_cents, tenant, order_id, debt_no),
+            (amount_cents, tenant, order_id, debt_no),
         )
-        conn.execute(
-            "UPDATE debt_entries SET status = CASE WHEN settled_cents >= amount_cents THEN 'settled' ELSE 'unsettled' END"
-            " WHERE tenant=? AND order_id=?",
-            (tenant, order_id),
-        )
+        _refresh_statuses(conn, tenant, order_id)
         settled_after = debt["settled_cents"] + amount_cents
         remaining_after = debt["amount_cents"] - settled_after
         remaining_total = conn.execute(

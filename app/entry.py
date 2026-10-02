@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from app.config import cursor_ttl_seconds
 from app.rules import cursor as cursors
 from app.rules import order_rules
-from app.store import debts, imports, ledger, orders, reconciliations, settlements, tickets
+from app.store import debts, imports, ledger, orders, payments, reconciliations, settlements, tickets
 from app.store.db import connect, migrate
 
 app = FastAPI(title="settlement-ledger")
@@ -28,6 +28,11 @@ class OrderIn(BaseModel):
     currency: str = Field(min_length=3, max_length=3)
 
 class PaymentIn(BaseModel):
+    amount_cents: int = Field(gt=0)
+
+class PaymentReversalIn(BaseModel):
+    reversal_id: str = Field(min_length=1)
+    payment_ref: str = Field(min_length=1)
     amount_cents: int = Field(gt=0)
 
 class RefundIn(BaseModel):
@@ -163,6 +168,21 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+@app.post("/orders/{order_id}/payments/reversals")
+def reverse_payment(order_id: str, body: PaymentReversalIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        result = payments.reverse_payment(
+            x_tenant, order_id, body.reversal_id, body.payment_ref, body.amount_cents
+        )
+    except payments.Conflict as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    if result is None:
+        # 被撤销收款不存在、订单不存在或跨租户统一按不存在处理，不泄漏对象是否存在。
+        raise HTTPException(status_code=404, detail="payment not found")
+    return result
 
 @app.post("/orders/{order_id}/refunds")
 def add_refund(order_id: str, body: RefundIn, x_tenant: str = Header(default="")) -> dict:
