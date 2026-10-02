@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from app.config import cursor_ttl_seconds
 from app.rules import cursor as cursors
 from app.rules import order_rules
-from app.store import imports, ledger, orders, reconciliations, settlements, tickets
+from app.store import debts, imports, ledger, orders, reconciliations, settlements, tickets
 from app.store.db import connect, migrate
 
 app = FastAPI(title="settlement-ledger")
@@ -32,6 +32,11 @@ class PaymentIn(BaseModel):
 
 class RefundIn(BaseModel):
     refund_id: str = Field(min_length=1)
+    amount_cents: int = Field(gt=0)
+
+class WriteoffIn(BaseModel):
+    writeoff_id: str = Field(min_length=1)
+    debt_no: int = Field(gt=0)
     amount_cents: int = Field(gt=0)
 
 class SettlementIn(BaseModel):
@@ -170,6 +175,30 @@ def add_refund(order_id: str, body: RefundIn, x_tenant: str = Header(default="")
     if result is None:
         raise HTTPException(status_code=404, detail="order not found")
     return result
+
+@app.post("/orders/{order_id}/writeoffs", status_code=201)
+def register_writeoff(order_id: str, body: WriteoffIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        result = debts.register(
+            x_tenant, order_id, body.writeoff_id, body.debt_no, body.amount_cents
+        )
+    except debts.Conflict as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    if result is None:
+        # 订单或欠款条目不存在、跨租户统一按不存在处理，不泄漏对象是否存在。
+        raise HTTPException(status_code=404, detail="debt entry not found")
+    return result
+
+@app.get("/orders/{order_id}/debts")
+def list_order_debts(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    items = debts.list_debts(x_tenant, order_id)
+    if items is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return {"tenant": x_tenant, "order_id": order_id, "debts": items}
 
 @app.post("/orders/{order_id}/settlements", status_code=201)
 def settle_order(order_id: str, body: SettlementIn, x_tenant: str = Header(default="")) -> dict:

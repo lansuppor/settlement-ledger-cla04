@@ -4,6 +4,7 @@ import sqlite3
 import threading
 
 from app.rules.order_rules import ALLOWED_CURRENCIES
+from app.store import debts
 from app.store.db import connect
 
 # 每个批次最多一个后台工作线程；重复提交或重启续跑都通过 _ensure_worker 汇入同一线程。
@@ -160,6 +161,8 @@ def _process_row(tenant: str, batch_id: str, row_no: int, raw) -> None:
                     "INSERT INTO orders(tenant, order_id, amount_cents, paid_cents, currency, status) VALUES(?,?,?,0,?,'accepted')",
                     (tenant, order_id, amount, currency),
                 )
+                # 与单笔受理一致：订单与第 1 条欠款同事务落库，续跑重入行时一并回滚。
+                debts.open_first(conn, tenant, order_id, amount, currency)
                 outcome, reason = "success", None
             except sqlite3.IntegrityError:
                 # 与库内已有订单重复：只拒绝该行，不改动既有订单。

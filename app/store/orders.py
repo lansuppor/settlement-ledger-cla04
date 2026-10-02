@@ -1,6 +1,6 @@
 import sqlite3
 
-from app.store import ledger
+from app.store import debts, ledger
 from app.store.db import connect
 
 MAX_PAGE_SIZE = 200
@@ -63,10 +63,17 @@ def search(
 def insert(tenant: str, order_id: str, amount_cents: int, currency: str) -> None:
     conn = connect()
     try:
+        # 订单与第 1 条欠款同事务落库：受理成功必有金额等于订单金额的欠款编号 1。
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             "INSERT INTO orders(tenant, order_id, amount_cents, paid_cents, currency, status) VALUES(?,?,?,0,?,'accepted')",
             (tenant, order_id, amount_cents, currency),
         )
+        debts.open_first(conn, tenant, order_id, amount_cents, currency)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
 
@@ -109,6 +116,8 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
             "SELECT COUNT(*) + 1 AS n FROM ledger_entries WHERE tenant=? AND order_id=? AND entry_type='payment'",
             (tenant, order_id),
         ).fetchone()["n"]
+        # 收款按欠款编号升序自动占用各条目未核销余额，与订单金额同事务生效。
+        debts.apply_payment(conn, tenant, order_id, amount_cents)
         ledger.append(
             conn, tenant, order_id, f"pay-{pay_no}", ledger.ENTRY_PAYMENT, amount_cents, outstanding_after
         )
@@ -168,6 +177,8 @@ def add_refund(tenant: str, order_id: str, refund_id: str, amount_cents: int) ->
             "UPDATE orders SET refunded_cents = refunded_cents + ?, status = CASE WHEN amount_cents - paid_cents + refunded_cents + ? > 0 THEN 'accepted' ELSE status END WHERE tenant=? AND order_id=?",
             (amount_cents, amount_cents, tenant, order_id),
         )
+        # 3.1) 生成一条金额等于退回金额的新欠款（未核销）；历史条目金额与已核销金额均不变。
+        debts.open_next(conn, tenant, order_id, amount_cents, row["currency"])
         # 4) 落退款流水：并发下不同订单复用同一（租户, 退款标识）在此撞主键，整笔回滚。
         try:
             conn.execute(

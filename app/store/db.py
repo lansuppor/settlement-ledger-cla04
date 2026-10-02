@@ -4,14 +4,17 @@ from pathlib import Path
 from app.config import db_path
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MIGRATIONS = ("001_init.sql", "002_refunds.sql", "003_imports.sql", "004_ledger.sql", "005_tickets.sql")
+MIGRATIONS = ("001_init.sql", "002_refunds.sql", "003_imports.sql", "004_ledger.sql", "005_tickets.sql", "006_debts.sql")
 
 def connect() -> sqlite3.Connection:
     path = db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, isolation_level=None)
+    conn = sqlite3.connect(path, isolation_level=None, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 并发写事务在 IMMEDIATE 锁上等待后重试，使竞争方读到最新状态并按业务规则拒绝，
+    # 而不是直接抛 SQLITE_BUSY。
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 def migrate() -> None:
