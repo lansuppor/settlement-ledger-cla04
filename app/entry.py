@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from app.config import cursor_ttl_seconds
 from app.rules import cursor as cursors
 from app.rules import order_rules
-from app.store import imports, ledger, orders, reconciliations, settlements
+from app.store import imports, ledger, orders, reconciliations, settlements, tickets
 from app.store.db import connect, migrate
 
 app = FastAPI(title="settlement-ledger")
@@ -44,6 +44,18 @@ class ImportIn(BaseModel):
     batch_id: str = Field(min_length=1)
     # 行内容逐行校验、部分成功，这里不做整批预校验。
     rows: list[dict] = Field(default_factory=list)
+
+class TicketIn(BaseModel):
+    tenant: str = Field(min_length=1)
+    ticket_id: str = Field(min_length=1)
+    order_id: str = Field(min_length=1)
+    ticket_type: str = Field(min_length=1)
+    # 问题描述非空在处理器内校验，保证不合法参数统一返回 400 而非 422。
+    description: str = ""
+
+class TicketProcessIn(BaseModel):
+    status: str = Field(min_length=1)
+    note: str | None = None
 
 @app.get("/health")
 def health() -> dict:
@@ -206,6 +218,87 @@ def read_reconciliation(
     if result is None:
         raise HTTPException(status_code=404, detail="reconciliation not found")
     return result
+
+@app.post("/tickets", status_code=201)
+def register_ticket(body: TicketIn) -> dict:
+    if body.ticket_type not in tickets.TICKET_TYPES:
+        raise HTTPException(status_code=400, detail="unsupported ticket_type")
+    if not body.description:
+        raise HTTPException(status_code=400, detail="description is required")
+    try:
+        result = tickets.register(
+            body.tenant, body.order_id, body.ticket_id, body.ticket_type, body.description
+        )
+    except tickets.Conflict as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    if result is None:
+        # 订单不存在或跨租户统一按不存在处理，不泄漏对象是否存在。
+        raise HTTPException(status_code=404, detail="order not found")
+    return result
+
+@app.post("/tickets/{ticket_id}/process")
+def process_ticket(ticket_id: str, body: TicketProcessIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if body.status not in tickets.STATUSES:
+        raise HTTPException(status_code=400, detail="unsupported status")
+    try:
+        result = tickets.process(x_tenant, ticket_id, body.status, body.note)
+    except tickets.Conflict as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    if result is None:
+        raise HTTPException(status_code=404, detail="ticket not found")
+    return result
+
+@app.get("/tickets/{ticket_id}")
+def read_ticket(ticket_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    result = tickets.get(x_tenant, ticket_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="ticket not found")
+    return result
+
+@app.get("/tickets")
+def search_tickets(
+    order_id: str | None = None,
+    status: str | None = None,
+    page_size: int = 50,
+    cursor: str | None = None,
+    x_tenant: str = Header(default=""),
+) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if status is not None and status not in tickets.STATUSES:
+        raise HTTPException(status_code=400, detail="unsupported status")
+    filters = {"order_id": order_id, "status": status}
+    after = None
+    if cursor is not None:
+        # 游标规则与订单检索一致：只在同租户、同过滤条件且未过期时有效。
+        try:
+            data = cursors.decode(cursor)
+        except cursors.CursorError as error:
+            raise HTTPException(status_code=400, detail=error.reason)
+        if data["tenant"] != x_tenant:
+            raise HTTPException(status_code=400, detail="cursor_tenant_mismatch")
+        if time.time() - float(data["iat"]) > cursor_ttl_seconds():
+            raise HTTPException(status_code=400, detail="cursor_expired")
+        if data["filters"] != filters:
+            raise HTTPException(status_code=400, detail="cursor_filter_mismatch")
+        after = tuple(data["last"])
+    page, has_more = tickets.search(x_tenant, order_id, status, page_size, after)
+    next_cursor = None
+    if has_more and page:
+        next_cursor = cursors.encode(
+            {
+                "v": 1,
+                "tenant": x_tenant,
+                "filters": filters,
+                "last": [page[-1]["order_id"], page[-1]["ticket_id"]],
+                "iat": time.time(),
+            }
+        )
+    return {"tenant": x_tenant, "tickets": page, "next_cursor": next_cursor}
 
 def main() -> None:
     parser = argparse.ArgumentParser()

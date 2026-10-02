@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款、按笔登记退款、批量导入订单、条件检索、订单结算与冲正、订单账务历史与按租户对账核销，并核对未收金额；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款、按笔登记退款、批量导入订单、条件检索、订单结算与冲正、订单账务历史与按租户对账核销，并核对未收金额；另支持针对订单受理、收款、退款、结算、冲正环节的问题登记工单并跟踪处理，形成可解释的闭环；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -31,6 +31,10 @@
 - `GET /orders/{order_id}/ledger`：订单账务历史。按时间与业务标识升序返回收款、退款、结算、冲正条目，每条含 `biz_ref`（业务标识；收款无外部标识时为 `pay-<订单内收款序号>`）、`type`、`amount_cents`、`outstanding_cents`（操作后未收金额）与时间。跨租户或订单不存在返回 404。按该序列逐笔重放即得到与订单读取接口一致的最终未收金额与状态。
 - `POST /reconciliations`：按租户发起对账。请求字段 `tenant`、`reconciliation_id`（调用方提供，同一租户内唯一）。在单个事务内取该租户全部订单的一致性快照并落库，返回 201 与汇总：`order_count`、`total_receivable_cents`（应收合计）、`total_paid_cents`、`total_refunded_cents`、`total_outstanding_cents` 与逐订单行（含当前是否存在生效结算 `has_active_settlement`）。恒有 应收 = 已收 + 未收（未收沿用订单口径，含退款回冲），逐订单金额与 `GET /orders/{order_id}` 一致。同一对账标识重复发起返回与首次一致的汇总，不重复计算；对账期间新发生的账务不改变已生成结果，须以新标识重新发起才反映。
 - `GET /reconciliations/{reconciliation_id}`：查询对账汇总。租户通过请求头 `X-Tenant` 传入；不存在或跨租户返回 404。
+- `POST /tickets`：登记工单。请求字段 `tenant`、`ticket_id`（调用方提供，同一租户内唯一）、`order_id`、`ticket_type`（`acceptance`/`payment`/`refund`/`settlement`/`reversal`，对应受理、收款、退款、结算、冲正五类）、`description`（问题描述，非空）。成功返回 201 与工单对象（含工单标识、订单标识、工单类型、处理状态 `pending`、创建时间）；订单不存在或跨租户返回 404（不泄漏对象是否存在）；参数不合法返回 400。同一工单标识对同一订单、同一工单类型重复登记返回与首次一致的结果，不重复受理；同标识换订单或换工单类型返回 409。
+- `POST /tickets/{ticket_id}/process`：处理工单。租户通过请求头 `X-Tenant` 传入；请求字段 `status`（目标状态）、`note`（处理备注，可空）。状态只在 `pending`（待处理）、`processing`（处理中）、`resolved`（已解决）、`rejected`（已驳回）之间按序推进：待处理可转处理中、已解决或已驳回；处理中可转已解决或已驳回；已解决与已驳回为终态。重复提交相同目标状态且备注一致返回与首次一致的结果，不重复处理；目标状态与当前状态相同但备注不同返回 409；跨状态跳跃返回 409 且工单状态与备注不变。处理不改动订单的金额、状态与账务，也不影响收款、退款、结算、冲正、导入、检索与对账结果。终态工单留存最后一次处理备注与处理时间（`note`、`processed_at`）。工单不存在或跨租户返回 404。
+- `GET /tickets/{ticket_id}`：按标识读取工单。租户通过请求头 `X-Tenant` 传入；不存在或跨租户返回 404。
+- `GET /tickets`：工单检索。租户通过请求头 `X-Tenant` 传入，结果严格限定在该租户内。查询参数均可选、可任意组合：`order_id`（订单标识）、`status`（处理状态）、`page_size`（每页条数，默认 50，上限 200，超过按上限截断）、`cursor`（下一页游标）。按订单标识升序返回 `{tickets, next_cursor}`；游标规则与订单检索一致（同租户、同过滤条件、未过期，非法/跨租户/换条件/过期分别返回可区分的原因）。
 - `GET /health`：返回服务与数据库状态。
 
 ### 退款调用示例
@@ -78,6 +82,34 @@ curl -s -X POST localhost:8000/reconciliations -H 'Content-Type: application/jso
 #         "total_refunded_cents":...,"total_outstanding_cents":...,"orders":[...]}
 # 恒有 total_receivable_cents = total_paid_cents + total_outstanding_cents
 # 查询：GET /reconciliations/rec-20261002-0001 -H 'X-Tenant: t1'
+```
+
+### 工单调用示例
+
+```bash
+# 登记工单：收款环节问题（工单标识由调用方生成，同一租户内唯一）
+curl -s -X POST localhost:8000/tickets -H 'Content-Type: application/json' \
+  -d '{"tenant": "t1", "ticket_id": "wk-20261003-0001", "order_id": "demo-1",
+       "ticket_type": "payment", "description": "客户已付款但订单未到账"}'
+# => 201 {"ticket_id":"wk-20261003-0001","order_id":"demo-1","ticket_type":"payment",
+#         "status":"pending","note":null,"processed_at":null,"created_at":"...",...}
+# 同标识对同订单同类型重复提交：原样返回首次结果，不重复受理；
+# 同标识换订单或换类型返回 409。
+
+# 处理工单：待处理 → 处理中 → 已解决（也可由待处理直接转已解决/已驳回）
+curl -s -X POST localhost:8000/tickets/wk-20261003-0001/process \
+  -H 'X-Tenant: t1' -H 'Content-Type: application/json' \
+  -d '{"status": "processing", "note": "联系支付渠道核查中"}'
+curl -s -X POST localhost:8000/tickets/wk-20261003-0001/process \
+  -H 'X-Tenant: t1' -H 'Content-Type: application/json' \
+  -d '{"status": "resolved", "note": "渠道补单完成，已到账"}'
+# 重复提交相同目标状态且备注一致：返回首次结果；同状态不同备注或跨状态跳跃返回 409。
+# 处理工单不改动订单金额、状态与账务。
+
+# 检索工单：按订单标识与处理状态任意组合过滤，按订单标识升序分页
+curl -s 'localhost:8000/tickets?order_id=demo-1&status=resolved&page_size=50' -H 'X-Tenant: t1'
+# => {"tenant":"t1","tickets":[...],"next_cursor":null}
+# 读取单个工单：GET /tickets/wk-20261003-0001 -H 'X-Tenant: t1'（跨租户按不存在处理）
 ```
 
 ### 批量导入调用示例
